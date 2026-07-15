@@ -11,9 +11,11 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <cstring>
 #include <string>
 #include <vector>
 
+#include <Poseidon/Network/NetworkConfig.hpp>
 #include <Poseidon/Network/MasterServerServiceClient.hpp>
 
 using namespace Poseidon;
@@ -21,6 +23,7 @@ using namespace Poseidon;
 TEST_CASE("master registration JSON serializes the version tag under 'vertag'", "[network][master][version]")
 {
     MasterServerServiceRegistration registration;
+    registration.app = "CWR";
     registration.address = "10.0.0.5";
     registration.hostPort = 2302;
     registration.serverId = BuildMasterServerServiceServerId(registration.address, registration.hostPort);
@@ -35,19 +38,21 @@ TEST_CASE("master registration JSON serializes the version tag under 'vertag'", 
     // The wire key is "vertag" with the registered value — the same key the Rust master
     // ingests and the C++ join validator's tag is compared against.
     REQUIRE(json.find("\"vertag\":\"rc1\"") != std::string::npos);
+    REQUIRE(json.find("\"app\":\"CWR\"") != std::string::npos);
 }
 
 TEST_CASE("master server-list parse roundtrips the version tag", "[network][master][version]")
 {
     // A served list row, as the master returns it (the "vertag" key alongside actver/reqver).
     const char* listJson = "[{\"address\":\"10.0.0.5\",\"hostport\":2302,\"hostname\":\"Tagged Server\","
-                           "\"gametype\":\"coop\",\"actver\":196,\"reqver\":196,\"vertag\":\"rc1\","
+                           "\"gametype\":\"coop\",\"app\":\"CWR\",\"actver\":196,\"reqver\":196,\"vertag\":\"rc1\","
                            "\"state\":14,\"numplayers\":1,\"maxplayers\":8,\"password\":false,"
                            "\"mod\":\"cwr\",\"equalModRequired\":false,\"impl\":\"papa-bear\"}]";
 
     std::vector<MasterServerServiceSession> sessions;
     REQUIRE(ParseMasterServerServiceListResponse(listJson, sessions));
     REQUIRE(sessions.size() == 1);
+    REQUIRE(sessions[0].app == "CWR");
     REQUIRE(sessions[0].versionTag == "rc1");
 
     // The browser projects the session into a MasterServerSessionInfo (the struct the
@@ -75,5 +80,86 @@ TEST_CASE("master registration builder carries platform", "[network][master]")
                                                               registration));
 
     REQUIRE(registration.platform == "linux");
+    REQUIRE(registration.app == "CWR");
     REQUIRE(BuildMasterServerServiceRegistrationJson(registration).find("\"platform\":\"linux\"") != std::string::npos);
+}
+
+TEST_CASE("master service list URL filters by app only", "[network][master][version]")
+{
+    const std::string url = BuildMasterServerServiceListUrl("https://master.example", MasterServerBrowserFilter{});
+
+    REQUIRE(url.find("app=CWR") != std::string::npos);
+    REQUIRE(url.find("includePasswordedServers=true") != std::string::npos);
+    REQUIRE(url.find("actver=") == std::string::npos);
+    REQUIRE(url.find("vertag=") == std::string::npos);
+}
+
+TEST_CASE("a 3.02 browser lists a 3.03 server as incompatible", "[network][master][version]")
+{
+    const char* listJson = "[{\"address\":\"10.0.0.7\",\"hostport\":2302,\"hostname\":\"CWR 3.03 Server\","
+                           "\"gametype\":\"coop\",\"app\":\"CWR\",\"actver\":303,\"reqver\":303,\"vertag\":\"rc303\","
+                           "\"state\":14,\"numplayers\":1,\"maxplayers\":8,\"password\":false,"
+                           "\"mod\":\"\",\"equalModRequired\":false,\"impl\":\"papa-bear\"}]";
+
+    std::vector<MasterServerServiceSession> sessions;
+    REQUIRE(ParseMasterServerServiceListResponse(listJson, sessions));
+    REQUIRE(sessions.size() == 1);
+
+    MasterServerSessionInfo listed;
+    AssignMasterServerServiceSessionInfo(sessions[0], listed);
+    REQUIRE(listed.actualVersion == 303);
+    REQUIRE(listed.requiredVersion == 303);
+    REQUIRE(std::strcmp(listed.versionTag, "rc303") == 0);
+
+    constexpr int Legacy302Actual = 302;
+    constexpr int Legacy302Required = 302;
+    REQUIRE_FALSE(listed.actualVersion < Legacy302Required);
+    REQUIRE(Legacy302Actual < listed.requiredVersion);
+}
+
+TEST_CASE("master service requests carry structured user-agent", "[network][master][version]")
+{
+    REQUIRE(BuildMasterServerServiceUserAgent(nullptr) == "CWR/303");
+
+    MasterServerServiceHttpRequest request;
+    REQUIRE(BuildMasterServerServiceGetRequest("https://master.example/v1/servers", request));
+
+    REQUIRE(request.userAgent.find("CWR/303") == 0);
+    REQUIRE(request.userAgent.find("tag=") != std::string::npos);
+    REQUIRE(request.userAgent.find("role=client") != std::string::npos);
+}
+
+TEST_CASE("master server attribution label includes the configured endpoint", "[network][master][ui]")
+{
+    REQUIRE(std::string(FormatNetworkMasterServerAttribution("https://master.example")) ==
+            "Operated by master.example");
+    REQUIRE(std::string(FormatNetworkMasterServerAttribution("http://master.example")) == "Operated by master.example");
+    REQUIRE(std::string(FormatNetworkMasterServerAttribution("master.example")) == "Operated by master.example");
+    REQUIRE(std::string(FormatNetworkMasterServerAttribution("")) == "Operated by disabled");
+}
+
+TEST_CASE("master mod list URL filters by current app and version", "[network][master][mods]")
+{
+    const std::string url = BuildMasterServerServiceModListUrl("https://master.example", "effects");
+
+    REQUIRE(url.find("/v1/mods?") != std::string::npos);
+    REQUIRE(url.find("app=CWR") != std::string::npos);
+    REQUIRE(url.find("actver=303") != std::string::npos);
+    REQUIRE(url.find("vertag=") != std::string::npos);
+    REQUIRE(url.find("q=effects") != std::string::npos);
+}
+
+TEST_CASE("master mod catalog parse carries compatibility fields", "[network][master][mods]")
+{
+    const char* json = "{\"modId\":\"effects-pack\",\"app\":\"CWR\",\"actver\":303,\"vertag\":\"dev\","
+                       "\"compatible\":true,\"name\":\"Effects Pack\",\"version\":\"1.0\","
+                       "\"description\":\"fx\",\"authors\":[\"author\"],\"sizeBytes\":42}";
+
+    MasterServerServiceModCatalogEntry entry;
+    REQUIRE(ParseMasterServerServiceModDetailResponse(json, entry));
+    REQUIRE(entry.modId == "effects-pack");
+    REQUIRE(entry.app == "CWR");
+    REQUIRE(entry.actualVersion == 303);
+    REQUIRE(entry.versionTag == "dev");
+    REQUIRE(entry.compatible);
 }
